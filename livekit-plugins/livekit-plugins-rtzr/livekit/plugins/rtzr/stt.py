@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+import weakref
+from collections import deque
 from dataclasses import dataclass
 
 import aiohttp
@@ -29,6 +32,7 @@ from livekit.agents import (
     APITimeoutError,
     stt,
     utils,
+    vad as agents_vad,
 )
 from livekit.agents.types import (
     NOT_GIVEN,
@@ -39,6 +43,7 @@ from .log import logger
 from .rtzrapi import DEFAULT_SAMPLE_RATE, RTZRConnectionError, RTZROpenAPIClient, RTZRStatusError
 
 _DEFAULT_CHUNK_MS = 100
+_IDLE_TIMEOUT_SECONDS = 25.0
 
 
 @dataclass
@@ -55,13 +60,7 @@ class _STTOptions:
 
 
 class STT(stt.STT):
-    """RTZR Streaming STT over WebSocket.
-
-    Uses RTZROpenAPIClient for authentication and WebSocket connection.
-    Audio frames streamed to `/v1/transcribe:streaming` endpoint.
-    Server performs endpoint detection (EPD), final messages carry `final=true`.
-    Stream is finalized by sending the string `EOS`.
-    """
+    """RTZR Streaming STT over WebSocket."""
 
     def __init__(
         self,
@@ -89,6 +88,11 @@ class STT(stt.STT):
             use_punctuation=use_punctuation,
         )
         self._client = RTZROpenAPIClient(http_session=http_session)
+        self._streams: weakref.WeakSet[SpeechStream] = weakref.WeakSet()
+        self._last_vad_speaking: bool | None = None
+        self._vad_speech_total = 0.0
+        self._vad_silence_total = 0.0
+        self._use_vad_endpointing = False
 
     async def aclose(self) -> None:
         """Close the RTZR client and cleanup resources."""
@@ -114,12 +118,74 @@ class STT(stt.STT):
             conn_options=conn_options,
         )
 
+    def on_vad_event(self, ev: agents_vad.VADEvent) -> None:  # pragma: no cover - logging only
+        try:
+            current: bool | None
+            if ev.type == agents_vad.VADEventType.START_OF_SPEECH:
+                current = True
+            elif ev.type == agents_vad.VADEventType.END_OF_SPEECH:
+                current = False
+            else:
+                current = ev.speaking
+
+            if current is None:
+                return
+
+            speech_total = self._vad_speech_total
+            silence_total = self._vad_silence_total
+            state_initialized = self._last_vad_speaking is not None
+
+            if current != self._last_vad_speaking:
+                if state_initialized or current:
+                    logger.info(
+                        "LK VAD speaking=%s (speech=%.3fs silence=%.3fs)",
+                        current,
+                        speech_total,
+                        silence_total,
+                    )
+                self._last_vad_speaking = current
+                if current:
+                    self._vad_silence_total = 0.0
+                else:
+                    self._vad_speech_total = 0.0
+
+            if ev.speaking is True and ev.speech_duration > self._vad_speech_total:
+                self._vad_speech_total = ev.speech_duration
+            elif ev.speaking is False and ev.silence_duration > self._vad_silence_total:
+                self._vad_silence_total = ev.silence_duration
+
+            self._use_vad_endpointing = True
+
+            for stream in list(self._streams):
+                stream._handle_vad_event(ev)
+        except Exception:
+            logger.exception("Failed to process LiveKit VAD event")
+
+    def _register_stream(self, stream: SpeechStream) -> None:
+        self._streams.add(stream)
+
+    def _unregister_stream(self, stream: SpeechStream) -> None:
+        self._streams.discard(stream)
+
 
 class SpeechStream(stt.SpeechStream):
     def __init__(self, *, stt: STT, conn_options: APIConnectOptions) -> None:
         super().__init__(stt=stt, conn_options=conn_options, sample_rate=stt._params.sample_rate)
         self._stt = stt
         self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._recv_task: asyncio.Task[None] | None = None
+        self._vad_event_queue: asyncio.Queue[agents_vad.VADEvent] = asyncio.Queue(maxsize=32)
+        self._speech_active = False
+        self._pending_speech_frames: deque[bytes] = deque()
+        self._connection_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
+        self._closed = False
+        self._idle_timeout = _IDLE_TIMEOUT_SECONDS
+        self._last_audio_at: float | None = None
+        self._idle_task: asyncio.Task[None] | None = None
+        self._fallback_mode = not self._stt._use_vad_endpointing
+
+        self._stt._register_stream(self)
 
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
         config = self._stt._client.build_config(
@@ -137,6 +203,15 @@ class SpeechStream(stt.SpeechStream):
             ws = await asyncio.wait_for(
                 self._stt._client.connect_websocket(config), timeout=self._conn_options.timeout
             )
+            logger.debug(
+                "RTZR STT WS connected (model=%s, sr=%s, epd=%.2fs, noise=%.2f, active=%.2f, punct=%s)",
+                self._stt._params.model_name,
+                self._stt._params.sample_rate,
+                self._stt._params.epd_time,
+                self._stt._params.noise_threshold,
+                self._stt._params.active_threshold,
+                self._stt._params.use_punctuation,
+            )
             return ws
         except asyncio.TimeoutError as e:
             raise APITimeoutError("WebSocket connection timeout") from e
@@ -153,65 +228,215 @@ class SpeechStream(stt.SpeechStream):
             raise APIConnectionError("RTZR API connection failed") from e
 
     async def _run(self) -> None:
-        while True:
+        send_task = asyncio.create_task(self._send_audio_task(), name="RTZR.send_audio")
+        vad_task = asyncio.create_task(self._process_vad_events(), name="RTZR.vad_events")
+        self._idle_task = asyncio.create_task(self._idle_watchdog(), name="RTZR.idle_watchdog")
+
+        try:
+            await asyncio.gather(send_task, vad_task)
+        finally:
+            self._closed = True
+            if not send_task.done():
+                await utils.aio.gracefully_cancel(send_task)
+            if not vad_task.done():
+                await utils.aio.gracefully_cancel(vad_task)
+            if self._idle_task is not None and not self._idle_task.done():
+                await utils.aio.gracefully_cancel(self._idle_task)
+            await self._await_recv_completion()
+            await self._cleanup_connection()
+            self._stt._unregister_stream(self)
+
+    def _handle_vad_event(self, ev: agents_vad.VADEvent) -> None:
+        if self._closed:
+            return
+
+        if ev.type == agents_vad.VADEventType.INFERENCE_DONE:
+            if ev.speaking:
+                self._last_audio_at = time.monotonic()
+            return
+
+        self._fallback_mode = False
+        try:
+            self._vad_event_queue.put_nowait(ev)
+        except asyncio.QueueFull:
+            logger.warning("Dropping VAD event due to backpressure")
+
+    async def _process_vad_events(self) -> None:
+        try:
+            while True:
+                ev = await self._vad_event_queue.get()
+                if ev.type == agents_vad.VADEventType.START_OF_SPEECH:
+                    await self._handle_vad_start(ev)
+                elif ev.type == agents_vad.VADEventType.END_OF_SPEECH:
+                    await self._handle_vad_end()
+        except asyncio.CancelledError:  # pragma: no cover - task cancellation
+            pass
+
+    async def _handle_vad_start(self, ev: agents_vad.VADEvent) -> None:
+        async with self._connection_lock:
+            if self._closed:
+                return
+
+            self._speech_active = True
+            self._last_audio_at = time.monotonic()
+            self._pending_speech_frames.clear()
+
+            await self._cleanup_connection()
+            ws = await self._connect_ws()
+            self._ws = ws
+            self._recv_task = asyncio.create_task(self._recv_loop(ws), name="RTZR.recv_loop")
+
+            for frame in ev.frames:
+                payload = frame.data.tobytes()
+                async with self._send_lock:
+                    await ws.send_bytes(payload)
+                self._last_audio_at = time.monotonic()
+
+    async def _handle_vad_end(self) -> None:
+        async with self._connection_lock:
+            self._speech_active = False
+
+            if not self._ws:
+                self._last_audio_at = None
+                self._pending_speech_frames.clear()
+                self._fallback_mode = not self._stt._use_vad_endpointing
+                return
+
+            await self._flush_pending_frames()
+
             try:
-                self._ws = await self._connect_ws()
-                send_task = asyncio.create_task(self._send_audio_task())
-                recv_task = asyncio.create_task(self._recv_task())
-                try:
-                    await asyncio.gather(send_task, recv_task)
-                finally:
-                    await utils.aio.gracefully_cancel(send_task, recv_task)
-            except asyncio.TimeoutError as e:
-                logger.error("RTZR STT connection timeout: %s", e)
-                raise APITimeoutError() from e
-            except aiohttp.ClientResponseError as e:
-                logger.error("RTZR STT status error: %s %s", e.status, e.message)
-                raise APIStatusError(
-                    message=e.message, status_code=e.status, request_id=None, body=None
-                ) from e
-            except aiohttp.ClientError as e:
-                logger.error("RTZR STT client error: %s", e)
-                raise APIConnectionError() from e
-            except Exception as e:
-                logger.exception("RTZR STT unexpected error: %s", e)
-                raise
+                await self._ws.send_str("EOS")
+                logger.info("Sent EOS to close audio stream")
+            except Exception as e:  # pragma: no cover - defensive logging
+                logger.error("Failed to send EOS: %s", e)
+
+            await self._await_recv_completion()
+            await self._cleanup_connection()
+            self._pending_speech_frames.clear()
+            self._last_audio_at = None
+            self._fallback_mode = not self._stt._use_vad_endpointing
+
+    async def _handle_idle_timeout(self) -> None:
+        async with self._connection_lock:
+            if not self._ws or not self._speech_active:
+                return
+
+            logger.info(
+                "RTZR STT idle timeout reached (%.0fs); closing websocket",
+                self._idle_timeout,
+            )
+
+            await self._flush_pending_frames()
+            try:
+                await self._ws.send_str("EOS")
+            except Exception:
+                logger.exception("Failed to send EOS during idle shutdown")
+
+            await self._await_recv_completion()
+            await self._cleanup_connection()
+
+            self._speech_active = False
+            self._pending_speech_frames.clear()
+            self._last_audio_at = None
+            self._fallback_mode = True
+
+    async def _idle_watchdog(self) -> None:
+        try:
+            while not self._closed:
+                await asyncio.sleep(1.0)
+                if not self._speech_active or not self._ws:
+                    continue
+                if self._last_audio_at is None:
+                    continue
+                if time.monotonic() - self._last_audio_at >= self._idle_timeout:
+                    await self._handle_idle_timeout()
+        except asyncio.CancelledError:  # pragma: no cover - task cancellation
+            pass
+
+    async def _cleanup_connection(self) -> None:
+        if self._ws:
+            try:
+                await self._ws.close()
             finally:
-                if self._ws:
-                    await self._ws.close()
-                    self._ws = None
-            break
+                self._ws = None
+
+    async def _await_recv_completion(self) -> None:
+        if self._recv_task:
+            try:
+                await asyncio.wait_for(self._recv_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                await utils.aio.gracefully_cancel(self._recv_task)
+            finally:
+                self._recv_task = None
+
+    async def _flush_pending_frames(self) -> None:
+        if not self._ws:
+            return
+
+        while self._pending_speech_frames:
+            payload = self._pending_speech_frames.popleft()
+            async with self._send_lock:
+                await self._ws.send_bytes(payload)
+            self._last_audio_at = time.monotonic()
+
+    async def _emit_audio(self, payload: bytes) -> None:
+        if not self._stt._use_vad_endpointing and not self._speech_active and not self._closed:
+            synthetic_ev = agents_vad.VADEvent(
+                type=agents_vad.VADEventType.START_OF_SPEECH,
+                samples_index=0,
+                timestamp=time.time(),
+                speech_duration=0.0,
+                silence_duration=0.0,
+            )
+            await self._handle_vad_start(synthetic_ev)
+
+        self._last_audio_at = time.monotonic()
+
+        if self._ws:
+            async with self._send_lock:
+                await self._ws.send_bytes(payload)
+        else:
+            self._pending_speech_frames.append(payload)
 
     @utils.log_exceptions(logger=logger)
     async def _send_audio_task(self) -> None:
-        assert self._ws
-        # Bundle audio into appropriate chunks using AudioByteStream
         audio_bstream = utils.audio.AudioByteStream(
             sample_rate=self._stt._params.sample_rate,
             num_channels=1,
             samples_per_channel=self._stt._params.sample_rate // (1000 // _DEFAULT_CHUNK_MS),
         )
+
         async for data in self._input_ch:
             if isinstance(data, rtc.AudioFrame):
-                # Write audio frame data to the byte stream
                 frames = audio_bstream.write(data.data.tobytes())
             elif isinstance(data, self._FlushSentinel):
-                # Flush any remaining audio data
                 frames = audio_bstream.flush()
             else:
                 frames = []
 
             for frame in frames:
-                await self._ws.send_bytes(frame.data.tobytes())
+                await self._emit_audio(frame.data.tobytes())
 
-        await self._ws.send_str("EOS")
-        logger.info("Sent EOS to close audio stream")
+        await self._flush_pending_frames()
+
+        if self._ws:
+            try:
+                await self._ws.send_str("EOS")
+                logger.info("Sent EOS to close audio stream")
+            except Exception:
+                logger.exception("Failed to send EOS during shutdown")
+            await self._await_recv_completion()
+
+        self._speech_active = False
+        self._last_audio_at = None
+        self._pending_speech_frames.clear()
 
     @utils.log_exceptions(logger=logger)
-    async def _recv_task(self) -> None:
-        assert self._ws
+    async def _recv_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         in_speech = False
-        async for msg in self._ws:
+        speech_started_at: float | None = None
+
+        async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
@@ -219,24 +444,23 @@ class SpeechStream(stt.SpeechStream):
                     logger.warning("Non-JSON text from RTZR STT: %s", msg.data)
                     continue
 
-                # Expected schema from reference: {"alternatives":[{"text": "..."}], "final": bool}
                 if "alternatives" in data and data["alternatives"]:
                     text = data["alternatives"][0].get("text", "")
                     is_final = bool(data.get("final", False))
                     if text:
-                        # Send START_OF_SPEECH if this is the first transcript in a sequence
                         if not in_speech:
                             in_speech = True
+                            speech_started_at = time.monotonic()
                             self._event_ch.send_nowait(
                                 stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
                             )
 
-                        # Send transcript event
                         event_type = (
                             stt.SpeechEventType.FINAL_TRANSCRIPT
                             if is_final
                             else stt.SpeechEventType.INTERIM_TRANSCRIPT
                         )
+
                         self._event_ch.send_nowait(
                             stt.SpeechEvent(
                                 type=event_type,
@@ -247,24 +471,28 @@ class SpeechStream(stt.SpeechStream):
                         )
 
                         if is_final:
+                            duration = (
+                                time.monotonic() - speech_started_at
+                                if speech_started_at is not None
+                                else 0.0
+                            )
+                            logger.info("VAD END_OF_SPEECH (speech_duration=%.2fs)", duration)
                             self._event_ch.send_nowait(
                                 stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH)
                             )
                             in_speech = False
+                            speech_started_at = None
 
-                # Handle error messages
                 if "error" in data:
-                    error_msg = data["error"]
                     raise APIStatusError(
-                        message=f"Server error: {error_msg}",
+                        message=f"Server error: {data['error']}",
                         status_code=500,
                         request_id=None,
                         body=None,
                     )
-                elif data.get("type") == "error" and "message" in data:
-                    error_msg = data["message"]
+                if data.get("type") == "error" and "message" in data:
                     raise APIStatusError(
-                        message=f"Server error: {error_msg}",
+                        message=f"Server error: {data['message']}",
                         status_code=500,
                         request_id=None,
                         body=None,
@@ -277,7 +505,7 @@ class SpeechStream(stt.SpeechStream):
             ):
                 break
             elif msg.type == aiohttp.WSMsgType.ERROR:
-                logger.error("WebSocket error: %s", self._ws.exception())
+                logger.error("WebSocket error: %s", ws.exception())
                 raise APIConnectionError("WebSocket error occurred")
             else:
                 logger.debug("Ignored WebSocket message type: %s", msg.type)
