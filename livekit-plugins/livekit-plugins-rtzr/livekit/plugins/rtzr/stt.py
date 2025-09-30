@@ -69,7 +69,7 @@ class STT(stt.STT):
         language: str = "ko",
         sample_rate: int = 8000,
         domain: str = "CALL",
-        epd_time: float = 0.3,
+        epd_time: float = 1.5,
         noise_threshold: float = 0.60,
         active_threshold: float = 0.80,
         use_punctuation: bool = False,
